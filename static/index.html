@@ -22,6 +22,9 @@ ol.trace{padding-left:0;list-style:none;counter-reset:s}ol.trace li{position:rel
 ol.trace li:before{counter-increment:s;content:counter(s);position:absolute;left:-14px;top:6px;width:26px;height:26px;border-radius:50%;background:var(--acc);color:#0b0e1a;text-align:center;font-weight:700;line-height:26px}
 .stage{font-weight:700;text-transform:uppercase;font-size:12px;color:var(--acc)}details{color:var(--mut);font-size:12px}pre{white-space:pre-wrap;word-break:break-word}
 ul{padding-left:20px}.empty{color:var(--mut)}.flash{outline:2px solid var(--acc)}
+.wg{width:100%;overflow-x:auto}.wg svg{display:block;min-width:760px}.wg text{font:12px system-ui,sans-serif;fill:#e8eaf6}
+.wg .nd rect{stroke-width:1.5;rx:8}.wg .nd{cursor:pointer}.wg .nd:hover rect{filter:brightness(1.4)}.wg .hd{fill:#9aa0c3;font-size:11px;letter-spacing:.06em}
+.wg path{fill:none;stroke-width:1.6;opacity:.75}.wg .dim{opacity:.15}.legend{font-size:12px;color:var(--mut);margin-top:6px}
 @media(max-width:900px){main{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>Evidence <span>Desk</span> <small style="color:var(--mut);font-weight:400">· the agent that can explain why</small></h1><span class="pill" id="mode">…</span></header>
@@ -54,16 +57,48 @@ function cite(ids){return ids.map(i=>`<span class="cid" onclick="jump('${esc(i)}
 window.jump=id=>{const el=document.getElementById('ev-'+id);if(el){el.scrollIntoView({behavior:'smooth',block:'center'});el.classList.add('flash');setTimeout(()=>el.classList.remove('flash'),1500)}};
 function render(d){
  const ev=d.evidence.map(e=>`<div class="ev ${e.polarity>0?'p':e.polarity<0?'n':''}" id="ev-${esc(e.id)}"><span class="cid">${esc(e.id)}</span><q>${esc(e.quote)}</q>
-  <div class="src">${e.url.startsWith('http')?`<a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.source_title)}</a>`:esc(e.source_title)} · for: ${esc(e.sub_question)}</div></div>`).join('')||'<p class="empty">No evidence found.</p>';
+  <div class="src">${e.url.startsWith('http')?`<a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.source_title)}</a>`:esc(e.source_title)} · for: ${esc(e.sub_question)} · score ${e.score}${e.matched_terms&&e.matched_terms.length?` · matched: ${esc(e.matched_terms.join(', '))}`:''}</div></div>`).join('')||'<p class="empty">No evidence found.</p>';
  const tr=d.trace.map(t=>`<li><div class="stage">${esc(t.stage)} <span style="color:var(--mut);font-weight:400">${t.ms} ms</span></div>${esc(t.summary)}
   <details><summary>details</summary><pre>${esc(JSON.stringify(t.detail,null,2))}</pre></details></li>`).join('');
  $('#out').innerHTML=`<div class="card"><h2>Recommendation</h2><div class="rec">${esc(d.recommendation)}</div>
   <span class="conf ${d.confidence_label}">confidence ${d.confidence} · ${d.confidence_label}</span>
   <div style="margin-top:10px"><button class="sec" onclick="dl()">Export markdown report</button></div></div>
+ <div class="card"><h2>Why-graph — recommendation → claims → quotes → sources</h2><div class="wg" id="wg"></div>
+  <div class="legend">Green edge = supports · red = cautions · grey = context. Hover a node to trace its path; click a quote to jump to it.
+  ${d.why_graph&&d.why_graph.uncited_evidence.length?`Uncited evidence (looked at, not relied on): ${d.why_graph.uncited_evidence.map(esc).join(', ')}.`:''}</div>
+  <details><summary>Mermaid source (paste into any Mermaid renderer / GitHub)</summary><pre>${esc(d.mermaid||'')}</pre></details></div>
  <div class="card"><h2>Why — claims linked to evidence</h2><ul>${d.reasoning.map(c=>`<li>${esc(c.claim)} ${cite(c.evidence_ids)}</li>`).join('')||'<li class="empty">No supported claims.</li>'}</ul></div>
  <div class="card"><h2>Explain-why trace</h2><ol class="trace">${tr}</ol></div>
  <div class="card"><h2>Evidence (verbatim quotes)</h2>${ev}</div>
  <div class="card"><h2>Open risks</h2><ul>${d.risks.map(x=>`<li>${esc(x)}</li>`).join('')}</ul><h2>Next actions</h2><ol>${d.next_actions.map(x=>`<li>${esc(x)}</li>`).join('')}</ol></div>
- <div class="card"><h2>Sources</h2><ul>${d.sources.map(s=>`<li>${esc(s.id)} · ${esc(s.kind)} · ${esc(s.status)} · ${s.url.startsWith('http')?`<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}</a>`:esc(s.title)}</li>`).join('')}</ul></div>`;}
+ <div class="card"><h2>Sources</h2><ul>${d.sources.map(s=>`<li>${esc(s.id)} · ${esc(s.kind)} · ${esc(s.status)} · ${s.url.startsWith('http')?`<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}</a>`:esc(s.title)}</li>`).join('')}</ul></div>`;
+ drawGraph(d.why_graph);}
+function wrap(t,n,max){const w=String(t).split(/\s+/),L=[];let c='';for(const x of w){if((c+' '+x).trim().length>n){if(c)L.push(c);c=x}else c=(c+' '+x).trim();if(L.length>=max)break}
+ if(L.length<max&&c)L.push(c);if(L.length>=max&&w.join(' ').length>L.join(' ').length)L[max-1]=L[max-1].replace(/.{0,1}$/,'…');return L}
+function drawGraph(g){const el=$('#wg');if(!g||!g.nodes.length){el.innerHTML='<p class="empty">No verified claims to graph.</p>';return}
+ const cols=[[],[],[],[]];g.nodes.forEach(n=>cols[n.layer].push(n));
+ const W=[200,210,300,210],X=[10,240,480,810],GAP=12,LH=15;const pos={};
+ const size=n=>{const lines=wrap(n.kind==='recommendation'?n.label+` (confidence ${n.confidence})`:n.kind==='evidence'?`${n.id}: “${n.label}”`:n.kind==='claim'?`${n.id}: ${n.label}`:n.label,
+   n.layer===2?44:30,n.kind==='source'?3:5);return {lines,h:lines.length*LH+14}};
+ let H=0;cols.forEach((c,ci)=>{let y=34;c.forEach(n=>{const s=size(n);pos[n.id]={x:X[ci],y,w:W[ci],h:s.h,lines:s.lines,n};y+=s.h+GAP});H=Math.max(H,y)});
+ // vertically centre shorter columns
+ cols.forEach((c,ci)=>{if(!c.length)return;const last=pos[c[c.length-1].id],used=last.y+last.h-34,off=(H-34-used)/2;c.forEach(n=>pos[n.id].y+=Math.max(0,off))});
+ const col=n=>n.kind==='recommendation'?['#2a2350','#b39cff']:n.kind==='claim'?['#1e2440','#7c9cff']:n.kind==='evidence'?(n.polarity>0?['#14261f','#4cd39b']:n.polarity<0?['#2b1620','#ff6b81']:['#1c2133','#9aa0c3']):['#262b45','#9aa0c3'];
+ const ec=e=>e.polarity>0?'#4cd39b':e.polarity<0?'#ff6b81':'#6b7299';
+ const paths=g.edges.map((e,i)=>{const a=pos[e.from],b=pos[e.to];if(!a||!b)return'';const x1=a.x+a.w,y1=a.y+a.h/2,x2=b.x,y2=b.y+b.h/2,m=(x1+x2)/2;
+  return `<path data-f="${esc(e.from)}" data-t="${esc(e.to)}" d="M${x1},${y1} C${m},${y1} ${m},${y2} ${x2},${y2}" stroke="${ec(e)}"/>`}).join('');
+ const nodes=Object.values(pos).map(p=>{const [f,s]=col(p.n);return `<g class="nd" data-id="${esc(p.n.id)}" transform="translate(${p.x},${p.y})"><title>${esc(p.n.label)}</title>
+  <rect width="${p.w}" height="${p.h}" fill="${f}" stroke="${s}"/>${p.lines.map((l,i)=>`<text x="8" y="${18+i*LH}">${esc(l)}</text>`).join('')}</g>`}).join('');
+ const hd=['RECOMMENDATION','CLAIMS','VERBATIM QUOTES','SOURCES'].map((t,i)=>`<text class="hd" x="${X[i]}" y="18">${t}</text>`).join('');
+ el.innerHTML=`<svg viewBox="0 0 1030 ${H+10}" height="${H+10}" xmlns="http://www.w3.org/2000/svg">${hd}${paths}${nodes}</svg>`;
+ const adj={};g.edges.forEach(e=>{(adj[e.from]=adj[e.from]||[]).push(e.to);(adj[e.to]=adj[e.to]||[]).push(e.from)});
+ const reach=id=>{// nodes on any path through id: walk up (left) and down (right) by layer
+  const L=Object.fromEntries(g.nodes.map(n=>[n.id,n.layer]));const keep=new Set([id]);
+  const walk=(s,dir)=>{(adj[s]||[]).forEach(t=>{if((L[t]-L[s])===dir&&!keep.has(t)){keep.add(t);walk(t,dir)}})};walk(id,1);walk(id,-1);return keep};
+ el.querySelectorAll('.nd').forEach(nd=>{const id=nd.dataset.id;
+  nd.onmouseenter=()=>{const k=reach(id);el.querySelectorAll('.nd').forEach(x=>x.classList.toggle('dim',!k.has(x.dataset.id)));
+   el.querySelectorAll('path').forEach(p=>p.classList.toggle('dim',!(k.has(p.dataset.f)&&k.has(p.dataset.t))))};
+  nd.onmouseleave=()=>el.querySelectorAll('.dim').forEach(x=>x.classList.remove('dim'));
+  nd.onclick=()=>{if(/^E\d+$/.test(id))jump(id);else if(id.startsWith('src:')){const n=pos[id].n;if(n.url&&n.url.startsWith('http'))window.open(n.url,'_blank','noopener')}}});}
 window.dl=()=>{if(!last)return;const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([last.markdown],{type:'text/markdown'}));a.download='evidence-desk-report.md';a.click();};
 </script></body></html>

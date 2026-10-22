@@ -9,7 +9,8 @@ from pathlib import Path
 
 from evidence_desk.agent import EvidenceDesk
 from evidence_desk.config import get_settings
-from evidence_desk.report import to_markdown
+from evidence_desk.sponsors import sponsor_status
+from evidence_desk.report import to_markdown, to_mermaid, why_graph
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -33,7 +34,7 @@ def make_handler(settings, getter=None):
             if self.path in ("/", "/index.html"):
                 self._send(200, (STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
             elif self.path == "/api/health":
-                self._json(200, {"ok": True, **settings.public()})
+                self._json(200, {"ok": True, **settings.public(), "sponsors": sponsor_status()})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -52,6 +53,8 @@ def make_handler(settings, getter=None):
                 res = desk.run(q, [str(s) for s in payload.get("snippets", [])][:10],
                                [str(u) for u in payload.get("urls", [])][:6], bool(payload.get("use_web")))
                 d = res.to_dict()
+                d["why_graph"] = why_graph(d)
+                d["mermaid"] = to_mermaid(d, d["why_graph"])
                 d["markdown"] = to_markdown(d)
                 return self._json(200, d)
             if self.path == "/api/report":
