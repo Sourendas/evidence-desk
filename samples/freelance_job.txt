@@ -1,0 +1,6 @@
+Job: Build an n8n workflow that syncs Shopify orders to Google Sheets and sends a Slack alert.
+Budget: $150 fixed price. Deadline: 3 days.
+The client has a verified payment method and 12 past hires with a 4.9 rating.
+Requirements: must have prior n8n experience and provide two portfolio links.
+The client mentions previous freelancers failed to deliver on time, so the deadline is strict.
+Remote, worldwide applicants welcome. Proposals so far: 35 to 50, which is competitive.
