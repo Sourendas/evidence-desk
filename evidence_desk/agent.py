@@ -6,6 +6,7 @@ conclusion was reached. Evidence quotes are always verbatim spans of fetched tex
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -13,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from .config import Settings, get_settings
 from .llm import LLMError, OpenAICompatLLM
 from .retrieval import Source, fetch_url, http_get, wikipedia_search
+from .sponsors import LocalMeter, NotConfigured, default_adapters
 
 STOPWORDS = set(
     """a an the and or but if of to in on for with by at from is are was were be been being this that
@@ -26,7 +28,17 @@ POSITIVE = {"free", "open", "eligible", "growing", "growth", "strong", "benefit"
 NEGATIVE = {"risk", "risks", "fee", "fees", "paid", "requires", "required", "limited", "restricted",
             "expensive", "decline", "declining", "ban", "banned", "fail", "failure", "scam", "card",
             "deadline", "ineligible", "costly", "difficult", "competition", "competitive", "unclear",
-            "lawsuit", "warning", "penalty", "loss"}
+            "lawsuit", "warning", "penalty", "loss", "must", "strict", "failed", "no"}
+# Words the template/LLM planners add that carry intent, not topic; excluded from relevance matching.
+PLANNER_FILLER = {"key", "facts", "regarding", "done", "next", "count", "against", "support", "supports",
+                  "benefits", "opportunities", "risks", "costs", "requirements", "main", "important"}
+RISK_CUES = ("risk", "cost", "against", "requirement", "downside", "concern", "drawback")
+BENEFIT_CUES = ("benefit", "opportunit", "support", "upside", "advantage")
+BM25_K1, BM25_B = 1.2, 0.75
+MIN_SCORE = 0.3
+DUP_JACCARD = 0.6        # token-set Jaccard at/above which two quotes count as near-duplicates
+SAME_SOURCE_DECAY = 0.7  # score multiplier per quote already taken from the same source (per sub-question)
+PER_SOURCE_CAP = 2       # max quotes from one source per sub-question
 
 
 @dataclass
@@ -39,6 +51,7 @@ class Evidence:
     quote: str
     score: float
     polarity: int  # +1 supports, -1 cautions, 0 neutral
+    matched_terms: list = field(default_factory=list)  # query terms that made this quote relevant
 
 
 @dataclass
@@ -74,6 +87,22 @@ def tokens(text: str) -> list[str]:
     return [t for t in re.findall(r"[a-z0-9][a-z0-9\-\+\.]*[a-z0-9]|[a-z0-9]", text.lower()) if t not in STOPWORDS]
 
 
+BIBLIO = re.compile(r"\(PDF\)|ISBN|doi:|Retrieved \d|Archived|Publishing( Ltd)?\.?$|Press\.$|\bpp?\. \d|"
+                    r"^[A-Z][a-z]+(, [A-Z][a-z]+)*: [^.]*(Press|Publishing|Books)")
+
+
+def stem(t: str) -> str:
+    """Tiny, deterministic stemmer: drop plural 's' and truncate to 7 chars
+    (freelancers/freelance -> 'freelan', required/requirements -> 'require')."""
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        t = t[:-1]
+    return t[:7]
+
+
+def stems(text: str) -> list[str]:
+    return [stem(t) for t in tokens(text)]
+
+
 def split_sentences(text: str) -> list[str]:
     parts = re.split(r"(?<=[.!?])\s+|\n+", text)
     out = []
@@ -83,10 +112,16 @@ def split_sentences(text: str) -> list[str]:
             continue  # skip citation titles, table rows, bullets of link lists
         if re.match(r"(From Wikipedia|Jump to|Retrieved|Archived from|This article)", p):
             continue
+        if BIBLIO.search(p) or len(p.split()) < 5:
+            continue  # bibliography/citation lines and fragments are not evidence
         if sum(c.isalpha() for c in p) / len(p) < 0.6:
             continue
         out.append(p)
     return out
+
+
+def jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a and b else 0.0
 
 
 def label(conf: float) -> str:
@@ -94,13 +129,17 @@ def label(conf: float) -> str:
 
 
 class EvidenceDesk:
-    def __init__(self, settings: Settings | None = None, getter=http_get, llm=None):
+    def __init__(self, settings: Settings | None = None, getter=http_get, llm=None,
+                 source_adapters: list | None = None, meter=None):
         self.settings = settings or get_settings()
         self.getter = getter
+        # Sponsor slots (see sponsors.py): extra evidence sources + usage metering. Off/local by default.
+        self.adapters = list(source_adapters) if source_adapters is not None else default_adapters()
+        self.meter = meter if meter is not None else LocalMeter()
         if llm is not None:
             self.llm = llm
         elif self.settings.live:
-            self.llm = OpenAICompatLLM(self.settings)
+            self.llm = OpenAICompatLLM(self.settings, meter=self.meter)
         else:
             self.llm = None
         self.trace: list[TraceStep] = []
@@ -154,56 +193,137 @@ class EvidenceDesk:
         if use_web:
             query = " ".join(tokens(question)[:6])
             sources.extend(wikipedia_search(query, limit=2, getter=self.getter))
+        adapter_notes = {}
+        for ad in self.adapters:
+            try:
+                got = list(ad.search(question, 3))[:3]
+                sources.extend(got)
+                adapter_notes[ad.name] = f"{len(got)} source(s)"
+            except NotConfigured as e:
+                adapter_notes[getattr(ad, "name", "adapter")] = f"skipped: {e}"
+            except Exception as e:  # an adapter must never break the run
+                adapter_notes[getattr(ad, "name", "adapter")] = f"failed: {type(e).__name__}"
         ok = [s for s in sources if s.status == "ok" and s.text]
         self._log("retrieve", f"Collected {len(ok)} usable source(s) out of {len(sources)} attempted.", t0,
                   sources=[{"id": s.id, "kind": s.kind, "title": s.title, "url": s.url, "status": s.status,
-                            "chars": len(s.text)} for s in sources])
+                            "chars": len(s.text)} for s in sources], adapters=adapter_notes)
         return sources
 
     # ---- 3. extract ---------------------------------------------------
     def extract(self, question: str, subs: list[str], sources: list[Source], per_sub: int = 3) -> list[Evidence]:
+        """Rank verbatim sentences per sub-question and pick a diverse, non-redundant set.
+
+        Relevance is BM25 over all candidate sentences (sub-question terms weigh 1.0, terms that only
+        appear in the main question 0.5), plus a polarity boost for risk/benefit sub-questions.
+        Selection is greedy and diversity-aware: near-duplicates of any already chosen quote
+        (token Jaccard >= DUP_JACCARD) are skipped, a source already used for this sub-question is
+        down-weighted, and each source may supply at most PER_SOURCE_CAP quotes per sub-question.
+        """
         t0 = time.time()
-        qtok = set(tokens(question))
+        pool = []  # (src, sentence, token list, token set)
+        for src in sources:
+            if src.status != "ok":
+                continue
+            seen_local: set[str] = set()
+            for sent in split_sentences(src.text):
+                st = stems(sent)
+                if st and sent not in seen_local:
+                    seen_local.add(sent)
+                    pool.append((src, sent, st, set(st), set(tokens(sent)) | set(re.findall(r"[a-z]+", sent.lower()))))
+        n = len(pool)
+        df: dict[str, int] = {}
+        for _, _, _, ss, _ in pool:
+            for t in ss:
+                df[t] = df.get(t, 0) + 1
+        idf = {t: math.log(1 + (n - d + 0.5) / (d + 0.5)) for t, d in df.items()}
+        avglen = (sum(len(p[2]) for p in pool) / n) if n else 1.0
+        filler = {stem(f) for f in PLANNER_FILLER}
+        qtok = set(stems(question)) - filler
+
         evidence: list[Evidence] = []
-        seen: set[str] = set()
+        chosen_sets: list[set] = []
+        used_sents: set[str] = set()
+        stats = {"candidates": n, "already_used_skipped": 0, "near_duplicates_skipped": 0, "source_cap_skips": 0}
+        picked: dict[str, list] = {sq: [] for sq in subs}
+        # Specific sub-questions (risks, benefits) pick first so generic "facts" questions don't
+        # consume the only risk/benefit sentences; evidence ids are still numbered in plan order.
+        order = sorted(range(len(subs)), key=lambda i: (0 if any(w in subs[i].lower() for w in RISK_CUES + BENEFIT_CUES) else 1, i))
+        cand_by_sq: dict[str, list] = {}
         for sq in subs:
-            stok = set(tokens(sq)) | qtok
-            is_risk = any(w in sq.lower() for w in ("risk", "cost", "against", "requirement", "downside"))
-            is_benefit = any(w in sq.lower() for w in ("benefit", "opportunit", "support", "upside"))
+            stok = set(stems(sq)) - filler
+            weights = {t: 1.0 for t in stok}
+            for t in qtok - stok:
+                weights[t] = 0.5
+            low = sq.lower()
+            is_risk = any(w in low for w in RISK_CUES)
+            is_benefit = any(w in low for w in BENEFIT_CUES) and not is_risk
             cands = []
-            for src in sources:
-                if src.status != "ok":
+            for src, sent, st, sset, raw in pool:
+                matched = sorted(t for t in weights if t in sset)
+                pos, neg = len(raw & POSITIVE), len(raw & NEGATIVE)
+                cue = (is_risk and neg > 0) or (is_benefit and pos > 0)
+                if not matched and not cue:
+                    continue  # must share a content word with the (sub-)question, or carry its risk/benefit cue
+                rel = 0.0
+                for t in matched:
+                    tf = st.count(t)
+                    rel += weights[t] * idf.get(t, 0.0) * tf * (BM25_K1 + 1) / (
+                        tf + BM25_K1 * (1 - BM25_B + BM25_B * len(st) / avglen))
+                score = rel + (0.8 * neg if is_risk else 0) + (0.8 * pos if is_benefit else 0)
+                score += 0.25 if src.kind == "snippet" else 0  # user-provided context first on ties
+                pol = 1 if pos > neg else -1 if neg > pos else 0
+                if not matched:
+                    score *= 0.5  # cue-only match: weaker than a topical match
+                if (is_risk and pol > 0) or (is_benefit and pol < 0):
+                    score *= 0.4  # off-polarity quote for a risk/benefit sub-question
+                if score < MIN_SCORE:
                     continue
-                for sent in split_sentences(src.text):
-                    st = tokens(sent)
-                    if not st:
-                        continue
-                    sset = set(st)
-                    overlap = len(stok & sset)
-                    if overlap == 0:
-                        continue  # must share at least one content word with the (sub-)question
-                    pos, neg = len(sset & POSITIVE), len(sset & NEGATIVE)
-                    score = overlap + (1.5 * neg if is_risk else 0) + (1.5 * pos if is_benefit else 0)
-                    score += 0.5 if src.kind == "snippet" else 0  # user-provided context first
-                    if score <= 0.5:
-                        continue
-                    pol = 1 if pos > neg else -1 if neg > pos else 0
-                    cands.append((score, sent, src, pol))
+                cands.append([score, sent, src, pol, sset, matched])
             cands.sort(key=lambda c: (-c[0], c[2].id, c[1]))
-            taken = 0
-            for score, sent, src, pol in cands:
-                if sent in seen:
-                    continue
-                seen.add(sent)
-                evidence.append(Evidence(f"E{len(evidence)+1}", sq, src.id, src.title, src.url, sent,
-                                         round(score, 2), pol))
-                taken += 1
-                if taken >= per_sub:
+            cand_by_sq[sq] = cands
+        used_src: dict[str, dict] = {sq: {} for sq in subs}
+        # Round-robin: each sub-question (specific ones first) takes its best remaining quote per round,
+        # so one generic sub-question cannot exhaust a small pool.
+        for _round in range(per_sub):
+            for sq in [subs[i] for i in order]:
+                cands, us = cand_by_sq[sq], used_src[sq]
+                while cands:
+                    # re-rank with a diversity penalty for sources already used by this sub-question
+                    best_i, best_adj = None, None
+                    for i, c in enumerate(cands):
+                        adj = c[0] * (SAME_SOURCE_DECAY ** us.get(c[2].id, 0))
+                        if best_adj is None or adj > best_adj + 1e-9:
+                            best_i, best_adj = i, adj
+                    score, sent, src, pol, sset, matched = cands.pop(best_i)
+                    if sent in used_sents:
+                        stats["already_used_skipped"] += 1
+                        continue
+                    if us.get(src.id, 0) >= PER_SOURCE_CAP:
+                        stats["source_cap_skips"] += 1
+                        continue
+                    if any(jaccard(sset, o) >= DUP_JACCARD for o in chosen_sets):
+                        stats["near_duplicates_skipped"] += 1
+                        continue
+                    chosen_sets.append(sset)
+                    used_sents.add(sent)
+                    us[src.id] = us.get(src.id, 0) + 1
+                    picked[sq].append(Evidence("", sq, src.id, src.title, src.url, sent, round(score, 2), pol,
+                                               matched[:6] or ["(risk/benefit cue)"]))
                     break
+        for sq in subs:
+            for e in picked[sq]:
+                e.id = f"E{len(evidence)+1}"
+                evidence.append(e)
         covered = len({e.sub_question for e in evidence})
-        self._log("extract", f"Extracted {len(evidence)} verbatim evidence quote(s); {covered}/{len(subs)} "
-                  f"sub-questions have support.", t0,
-                  per_sub_question={sq: [e.id for e in evidence if e.sub_question == sq] for sq in subs})
+        stats["distinct_sources"] = len({e.source_id for e in evidence})
+        self._log("extract", f"Ranked {n} candidate sentence(s) with BM25 + diversity; picked {len(evidence)} "
+                  f"verbatim quote(s) from {stats['distinct_sources']} source(s), skipped "
+                  f"{stats['near_duplicates_skipped']} near-duplicate(s); {covered}/{len(subs)} sub-questions "
+                  f"have support.", t0,
+                  per_sub_question={sq: [e.id for e in evidence if e.sub_question == sq] for sq in subs},
+                  ranking={"method": "bm25+polarity, greedy diversity re-rank", "k1": BM25_K1, "b": BM25_B,
+                           "dup_jaccard": DUP_JACCARD, "same_source_decay": SAME_SOURCE_DECAY,
+                           "per_source_cap": PER_SOURCE_CAP, **stats})
         return evidence
 
     # ---- 4. synthesize ------------------------------------------------
@@ -304,7 +424,10 @@ class EvidenceDesk:
         draft = self.synthesize(question, subs, ev, sources)
         final, conf = self.verify(draft, subs, ev, sources)
         t0 = time.time()
-        self._log("conclude", f"Final: {final['recommendation']}", t0, confidence=conf)
+        usage = self.meter.summary() if hasattr(self.meter, "summary") else {}
+        self.meter.record({"type": "run", "mode": "live" if self.llm else "stub", "evidence": len(ev),
+                           "sources": len(sources), "confidence": conf})
+        self._log("conclude", f"Final: {final['recommendation']}", t0, confidence=conf, usage=usage)
         return Result(
             question=question,
             mode="live" if self.llm else "stub",

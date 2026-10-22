@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.request
 
 from .config import Settings
@@ -30,8 +31,9 @@ def extract_json(text: str):
 class OpenAICompatLLM:
     name = "openai-compatible"
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, meter=None):
         self.s = settings
+        self.meter = meter  # optional usage meter (see sponsors.py); records tokens + latency, never the key
 
     def chat_json(self, system: str, user: str, max_tokens: int = 1200):
         body = json.dumps(
@@ -50,11 +52,16 @@ class OpenAICompatLLM:
             data=body,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.s.api_key}"},
         )
+        t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=self.s.timeout) as r:
                 data = json.loads(r.read().decode())
         except Exception as e:  # never include headers (key) in the message
             raise LLMError(f"LLM request failed: {type(e).__name__}") from None
+        if self.meter is not None:
+            u = (data.get("usage") if isinstance(data, dict) else None) or {}
+            self.meter.record({"type": "llm_call", "model": self.s.model, "ms": int((time.time() - t0) * 1000),
+                               "prompt_tokens": u.get("prompt_tokens"), "completion_tokens": u.get("completion_tokens")})
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"] or ""
