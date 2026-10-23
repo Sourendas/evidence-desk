@@ -80,6 +80,14 @@ python -m unittest discover -s tests -t .   # 22 stub-mode tests, no network/key
 - `POST /api/ask` `{question, snippets:[], urls:[], use_web:bool}` → result JSON (+ `why_graph`, `mermaid`, `markdown`)
 - `POST /api/report` (result JSON) → markdown
 
+## Demo video & submission
+- **Demo (2:53, voiceover):** real headless-Chrome screenshots of one live run with NVIDIA Nemotron 3 Nano
+  on Nebius Token Factory, narrated with free edge-tts. Narration script and timings:
+  [`demo/NARRATION.md`](demo/NARRATION.md). Rebuild with `demo/capture.py` (server running),
+  `demo/slides.py`, `demo/build.py` (needs Playwright + Chrome, ffmpeg, edge-tts).
+- **Track 02 submission copy:** [`docs/DEVPOST.md`](docs/DEVPOST.md).
+- Latest live sample report (same run as the video): [`samples/sample_report_live.md`](samples/sample_report_live.md).
+
 ## Sponsor integration (adapter slots)
 `evidence_desk/sponsors.py` defines the integration points; nothing sponsor-side is called yet
 (no accounts created, nothing paid):
