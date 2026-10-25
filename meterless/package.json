@@ -1,0 +1,10 @@
+{
+  "name": "evidence-desk-meterless-bridge",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "setup": "npx --yes degit meterless/meterless/engines/hmem/reference vendor/hmem --force && cd vendor/hmem && npm install --no-audit --no-fund"
+  },
+  "devDependencies": { "tsx": "^4.19.0" }
+}

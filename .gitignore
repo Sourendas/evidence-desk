@@ -6,3 +6,6 @@ __pycache__/
 .venv/
 reports/
 *.log
+meterless/vendor/
+meterless/node_modules/
+.evidence-memory/
