@@ -1,3 +1,5 @@
+import os
+os.environ.setdefault('EVIDENCE_MEMORY', 'off')  # unit tests stay offline; see TestMeterlessMemory
 import json
 import threading
 import unittest
@@ -268,3 +270,25 @@ class TestServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMeterlessMemory(unittest.TestCase):
+    """Real Meterless H-MEM round trip (runs only when the engine is vendored)."""
+
+    def test_recall_after_remember(self):
+        import tempfile
+        from evidence_desk.sponsors import MeterlessMemory
+        m = MeterlessMemory()
+        os.environ["EVIDENCE_MEMORY"] = "on"
+        try:
+            if not m.enabled:
+                self.skipTest("H-MEM not vendored (cd meterless && npm install && npm run setup)")
+            with tempfile.TemporaryDirectory() as d:
+                os.environ["EVIDENCE_MEMORY_DIR"] = d
+                w = m.remember("bid on the n8n job?", "Bid", 0.8,
+                               [{"claim": "Budget fits", "quotes": ["Budget is $500"], "sources": ["pasted"]}])
+                self.assertTrue(w["ok"]); self.assertEqual(len(w["stored"]), 2)
+                r = m.recall("n8n job budget")
+                self.assertTrue(r["ok"]); self.assertTrue(r["memories"])
+        finally:
+            os.environ["EVIDENCE_MEMORY"] = "off"; os.environ.pop("EVIDENCE_MEMORY_DIR", None)

@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from .config import Settings, get_settings
 from .llm import LLMError, OpenAICompatLLM
 from .retrieval import Source, fetch_url, http_get, wikipedia_search
-from .sponsors import LocalMeter, NotConfigured, default_adapters
+from .sponsors import LocalMeter, NotConfigured, default_adapters, default_memory
 
 STOPWORDS = set(
     """a an the and or but if of to in on for with by at from is are was were be been being this that
@@ -130,12 +130,14 @@ def label(conf: float) -> str:
 
 class EvidenceDesk:
     def __init__(self, settings: Settings | None = None, getter=http_get, llm=None,
-                 source_adapters: list | None = None, meter=None):
+                 source_adapters: list | None = None, meter=None, memory="default"):
         self.settings = settings or get_settings()
         self.getter = getter
         # Sponsor slots (see sponsors.py): extra evidence sources + usage metering. Off/local by default.
         self.adapters = list(source_adapters) if source_adapters is not None else default_adapters()
         self.meter = meter if meter is not None else LocalMeter()
+        # Meterless H-MEM case memory (real, keyless). None = off.
+        self.memory = default_memory() if memory == "default" else memory
         if llm is not None:
             self.llm = llm
         elif self.settings.live:
@@ -413,16 +415,45 @@ class EvidenceDesk:
                   cited_fraction=round(cited, 2), dropped_claims=dropped)
         return draft, conf
 
+    # ---- Meterless H-MEM case memory ----------------------------------
+    def recall_memory(self, question: str) -> list:
+        if not self.memory:
+            return []
+        t0 = time.time()
+        r = self.memory.recall(question)
+        mems = r.get("memories", []) if r.get("ok") else []
+        self._log("memory", f"Meterless H-MEM recalled {len(mems)} prior verified finding(s) "
+                  "(context only, never cited as evidence).", t0, engine="meterless/h-mem",
+                  ok=bool(r.get("ok")), error=r.get("error"), memories=mems)
+        return mems
+
+    def store_memory(self, question: str, final: dict, conf: float, ev: list) -> None:
+        if not self.memory:
+            return
+        t0 = time.time()
+        by_id = {e.id: e for e in ev}
+        findings = []
+        for r in final.get("reasoning", []):
+            es = [by_id[i] for i in r.get("evidence_ids", []) if i in by_id]
+            findings.append({"claim": r.get("claim", ""), "quotes": [e.quote for e in es][:1],
+                             "sources": [e.url or e.source_id for e in es][:1]})
+        r = self.memory.remember(question, str(final.get("recommendation", "")), conf, findings)
+        self._log("remember", f"Stored {len(r.get('stored', []))} H-MEM record(s) with trust-ledger entries.",
+                  t0, engine="meterless/h-mem", ok=bool(r.get("ok")), error=r.get("error"),
+                  stored=r.get("stored", []))
+
     # ---- run ----------------------------------------------------------
     def run(self, question: str, snippets: list[str] | None = None, urls: list[str] | None = None,
             use_web: bool = False) -> Result:
         self.trace = []
         snippets, urls = snippets or [], urls or []
         subs = self.plan(question, len(snippets), len(urls))
+        prior = self.recall_memory(question)
         sources = self.retrieve(question, snippets, urls, use_web)
         ev = self.extract(question, subs, sources)
         draft = self.synthesize(question, subs, ev, sources)
         final, conf = self.verify(draft, subs, ev, sources)
+        self.store_memory(question, final, conf, ev)
         t0 = time.time()
         usage = self.meter.summary() if hasattr(self.meter, "summary") else {}
         self.meter.record({"type": "run", "mode": "live" if self.llm else "stub", "evidence": len(ev),

@@ -113,4 +113,62 @@ def default_meter():
 def sponsor_status() -> dict:
     """Safe-to-display status (never includes secrets)."""
     return {"zetaris": "configured (client pending)" if ZetarisAdapter().enabled else "slot (off)",
-            "meterless": "configured (local only)" if MeterlessMeter().enabled else "slot (local meter)"}
+            "meterless_hmem": "on (open-source engine, no key)" if MeterlessMemory().enabled else "off (run meterless setup)"}
+
+
+# ---------------------------------------------------------------------------
+# Meterless H-MEM case memory (REAL integration, open-source engine, no key)
+# ---------------------------------------------------------------------------
+import json as _json
+import pathlib as _pathlib
+import shutil as _shutil
+import subprocess as _subprocess
+
+_BRIDGE_DIR = _pathlib.Path(__file__).resolve().parent.parent / "meterless"
+
+
+class MeterlessMemory:
+    """Long-term case memory backed by Meterless H-MEM (github.com/Meterless/Meterless, Apache-2.0).
+
+    The engine is TypeScript, so we call it through ``meterless/bridge.ts`` (Node + tsx) over
+    stdin/stdout JSON. ``recall`` returns prior *verified* findings ranked by H-MEM's
+    MemoryRetrievalService; ``remember`` stores the conclusion and each kept claim with its verified
+    quote via MemoryStoreService, with every write recorded in H-MEM's append-only TrustLedger.
+    Recalled memories are shown as context only; they are never cited as evidence.
+    Enabled when the engine is vendored (``cd meterless && npm install && npm run setup``) and
+    ``EVIDENCE_MEMORY`` is not ``off``.
+    """
+
+    name = "meterless-hmem"
+
+    def __init__(self, bridge_dir=None, timeout: float = 30.0):
+        self.dir = _pathlib.Path(bridge_dir) if bridge_dir else _BRIDGE_DIR
+        self.timeout = timeout
+
+    @property
+    def enabled(self) -> bool:
+        return (os.environ.get("EVIDENCE_MEMORY", "on").lower() != "off"
+                and (self.dir / "vendor" / "hmem" / "src" / "index.ts").exists()
+                and _shutil.which("npx") is not None)
+
+    def _call(self, req: dict) -> dict:
+        tsx = self.dir / "node_modules" / ".bin" / "tsx"
+        cmd = [str(tsx), "bridge.ts"] if tsx.exists() else ["npx", "--yes", "tsx", "bridge.ts"]
+        try:
+            p = _subprocess.run(cmd, input=_json.dumps(req), capture_output=True, text=True,
+                                cwd=self.dir, timeout=self.timeout)
+            return _json.loads(p.stdout or "{}")
+        except Exception as e:  # never break an investigation because memory failed
+            return {"ok": False, "error": str(e)[:200]}
+
+    def recall(self, question: str, top_n: int = 3) -> dict:
+        return self._call({"op": "recall", "question": question, "topN": top_n})
+
+    def remember(self, question: str, recommendation: str, confidence: float, findings: list) -> dict:
+        return self._call({"op": "remember", "question": question, "recommendation": recommendation,
+                           "confidence": confidence, "findings": findings})
+
+
+def default_memory():
+    m = MeterlessMemory()
+    return m if m.enabled else None
