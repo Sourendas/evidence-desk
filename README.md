@@ -64,7 +64,7 @@ python server.py            # http://127.0.0.1:8787  (click "Load sample" → "I
 python cli.py "Should I bid on this n8n freelance job?" \
   --snippet-file samples/freelance_job.txt --snippet-file samples/my_profile.txt \
   --url https://en.wikipedia.org/wiki/N8n --md report.md
-python -m unittest discover -s tests -t .   # 22 stub-mode tests, no network/key needed
+python -m unittest discover -s tests -t .   # 23 tests, no network/key needed
 ```
 
 ### LLM modes
@@ -81,6 +81,7 @@ python -m unittest discover -s tests -t .   # 22 stub-mode tests, no network/key
 - `POST /api/report` (result JSON) → markdown
 
 ## Demo video & submission
+- **Watch:** https://vimeo.com/1239163509 (2:53)  ·  **Slide deck:** [`docs/evidence_desk_deck.pdf`](docs/evidence_desk_deck.pdf)
 - **Demo (2:53, voiceover):** real headless-Chrome screenshots of one live run with NVIDIA Nemotron 3 Nano
   on Nebius Token Factory, narrated with free edge-tts. Narration script and timings:
   [`demo/NARRATION.md`](demo/NARRATION.md). Rebuild with `demo/capture.py` (server running),
@@ -88,21 +89,49 @@ python -m unittest discover -s tests -t .   # 22 stub-mode tests, no network/key
 - **Track 02 submission copy:** [`docs/DEVPOST.md`](docs/DEVPOST.md).
 - Latest live sample report (same run as the video): [`samples/sample_report_live.md`](samples/sample_report_live.md).
 
-## Sponsor integration (adapter slots)
-`evidence_desk/sponsors.py` defines the integration points; nothing sponsor-side is called yet
-(no accounts created, nothing paid):
-- **Zetaris → `ZetarisAdapter` (evidence source).** Any object with `name` + `search(question, limit) -> [Source]`
-  can be passed as `EvidenceDesk(source_adapters=[...])`; its sources go through the same
-  extract → verify pipeline, so quotes are verbatim-checked and cited like any other source.
-  The Zetaris adapter is off unless `ZETARIS_ENDPOINT` + `ZETARIS_TOKEN` are set, and the client
-  itself is still a stub (records "skipped" in the retrieve trace step).
-- **Meterless → `MeterlessMeter` (usage metering).** Every LLM call emits a usage event
-  (model, prompt/completion tokens, latency — never the key) to a meter, plus one event per run.
-  `LocalMeter` is always on and its totals appear in the conclude trace step and report; the
-  Meterless meter is enabled by `METERLESS_API_KEY` but currently keeps events local only.
+## Sponsor tech: Meterless, Zetaris, NVIDIA, Cursor (honest status)
+
+| Sponsor | Status | Where |
+|---|---|---|
+| **Meterless** | **Integrated** (open-source H-MEM engine, no key, zero cost) | `meterless/bridge.ts`, `MeterlessMemory` in `evidence_desk/sponsors.py`, `memory` + `remember` trace steps |
+| **Zetaris** | **Not integrated** — adapter slot only, no calls made | `ZetarisAdapter` in `evidence_desk/sponsors.py` |
+| **NVIDIA** | Integrated — Nemotron 3 Nano 30B-A3B is the live model | `evidence_desk/llm.py` via Nebius Token Factory |
+| **Cursor** | Used to build the project | — |
+
+**Meterless H-MEM case memory.** Evidence Desk remembers what it has already *verified*:
+- After **verify**, the decision and each kept claim (with its verbatim-verified quote and source) are
+  stored via H-MEM's `MemoryStoreService`; every write lands in H-MEM's append-only `TrustLedger`.
+- At the start of the next investigation, a **memory** step queries H-MEM's `MemoryRetrievalService`
+  and lists ranked prior findings (memory ids, relevance, ledger entries) in the explain-why trace.
+- Recalled memories are **context only**: they are never cited as evidence, so the "every claim
+  traces to a verbatim quote in this run's sources" guarantee is unchanged.
+- The engine is TypeScript; Python talks to it with one JSON request per call over stdin/stdout.
+  If Node or the engine is missing, the steps are simply skipped and the agent still works.
+
+Setup (Node 18+):
+```bash
+cd app/meterless && npm install && npm run setup   # vendors github.com/Meterless/Meterless engines/hmem/reference into vendor/ (gitignored)
+```
+State lives in `app/.evidence-memory/` (gitignored; override with `EVIDENCE_MEMORY_DIR`). Disable with `EVIDENCE_MEMORY=off`.
+`tests/test_agent.py::TestMeterlessMemory` does a real remember → recall round trip when the engine is vendored.
+
+**Zetaris (not integrated).** Hackathon accounts need either your own AWS account linked to create a
+cluster, or a local Docker install (~16 GB RAM). Neither fit this zero-cost, no-card build, so no
+Zetaris code runs. `ZetarisAdapter` marks the integration point: any object with
+`name` + `search(question, limit) -> [Source]` passed as `EvidenceDesk(source_adapters=[...])` has its
+sources run through the same extract → verify pipeline (ids `Z1`, `Z2`…).
+
+**Usage meter.** `LocalMeter` records per-LLM-call tokens and latency (never the key) for the conclude
+step. (`MeterlessMeter` is a legacy name for that same local meter; nothing is sent anywhere.)
+
+## Dependencies
+- Core agent, server, CLI, tests: Python 3.10+ standard library only.
+- Optional live LLM: any OpenAI-compatible endpoint key (free Nebius credits were used).
+- Optional Meterless memory: Node 18+, `tsx` (installed by `npm install`), H-MEM reference (Apache-2.0).
+- Demo rebuild only: Playwright + Chrome, ffmpeg, edge-tts.
 
 ## Roadmap
-- Real Zetaris + Meterless clients behind the existing slots (once sponsor access is available)
+- Zetaris adapter once a free runtime is available; H-MEM feedback + sleep-cycle consolidation
 - More keyless sources; contradiction detection between sources
 - Per-claim confidence in the why-graph
 
